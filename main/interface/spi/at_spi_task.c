@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -22,6 +23,11 @@
 
 #define AT_SPI_DMA_SIZE                 4092
 #define SLAVE_CONFIG_ADDR               4
+
+/* 超时宏: 防止 SPI 事务永远阻塞卡死任务 */
+#define SPI_QUEUE_TRANS_TIMEOUT_MS      5000    /* spi_slave_hd_queue_trans 最多等 5s */
+#define SPI_GET_RES_TIMEOUT_MS          5000    /* spi_slave_hd_get_trans_res 最多等 5s */
+#define SPI_XQUEUE_TIMEOUT_MS           30000   /* xQueueReceive 最多等 30s, 超时则循环继续 */
 
 typedef enum {
     SPI_NULL = 0,
@@ -70,7 +76,11 @@ static bool master_write_buffer_cb(void *arg, spi_slave_hd_event_t *event, BaseT
         .direct = SPI_SLAVE_RD,
     };
 
-    xQueueSendFromISR(s_spi_msg_queue, (void *)&spi_msg, &must_yield);
+    ESP_EARLY_LOGE(TAG, "!!! master_write_buffer_cb FIRE queue=%p", (void*)s_spi_msg_queue);
+    BaseType_t r = xQueueSendFromISR(s_spi_msg_queue, (void *)&spi_msg, &must_yield);
+    ESP_EARLY_LOGE(TAG, "!!! xQueueSendFromISR r=%d must_yield=%d", (int)r, (int)must_yield);
+    if (must_yield && awoken)
+        *awoken = pdTRUE;
     return true;
 }
 
@@ -166,8 +176,12 @@ static void at_spi_task(void *params)
         return;
     }
 
+    ESP_LOGE(TAG, "spi_task: stack_here=%p buffer=%p queue=%p rw_sema=%p",
+             params, (void*)buffer, (void*)s_spi_msg_queue, (void*)s_spi_rw_sema);
+
     // wait for AT ready
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ESP_LOGE(TAG, "spi_task: unblocked from ulTaskNotifyTake");
 
     spi_slave_hd_data_t *ret_trans;
     while (1) {
@@ -178,27 +192,50 @@ static void at_spi_task(void *params)
         // set handshake pin to low level
         gpio_set_level(CONFIG_SPI_HANDSHAKE_PIN, 0);
 
-        xQueueReceive(s_spi_msg_queue, (void*)&trans_msg, portMAX_DELAY);
-        ESP_LOGD(TAG, "direct: %d", trans_msg.direct);
+        ESP_LOGE(TAG, "spi_task: waiting xQueueReceive (queue depth=%u)",
+                 uxQueueMessagesWaiting(s_spi_msg_queue));
+        BaseType_t qr = xQueueReceive(s_spi_msg_queue, (void*)&trans_msg,
+                                       pdMS_TO_TICKS(SPI_XQUEUE_TIMEOUT_MS));
+        if (qr != pdPASS) {
+            ESP_LOGE(TAG, "spi_task: xQueueReceive timeout (%us), loop continue",
+                     SPI_XQUEUE_TIMEOUT_MS / 1000);
+            continue;
+        }
+        ESP_LOGE(TAG, "spi_task: got queue msg r=%d direct=%d", (int)qr, (int)trans_msg.direct);
         spi_slave_hd_data_t slave_trans;
         memset(&slave_trans, 0x0, sizeof(spi_slave_hd_data_t));
 
         if (trans_msg.direct == SPI_SLAVE_RD) {
-            // master -> slave
-            // tell master transmit mode is master send
+            // master -> slave (主机发 AT 命令过来)
+            ESP_LOGE(TAG, "spi_task: SPI_SLAVE_RD path, buf[0..3]=%02X %02X %02X %02X",
+                     buffer[0], buffer[1], buffer[2], buffer[3]);
             at_spi_write_transmit_len(SPI_SLAVE_RD, AT_SPI_DMA_SIZE);
+            ESP_LOGE(TAG, "spi_task: wrote transmit_len=4092, queue RX DMA");
 
             slave_trans.data = buffer;
             slave_trans.len = AT_SPI_DMA_SIZE;
-            ESP_ERROR_CHECK(spi_slave_hd_queue_trans(SPI2_HOST, SPI_SLAVE_CHAN_RX, &slave_trans, portMAX_DELAY));
+            esp_err_t t = spi_slave_hd_queue_trans(SPI2_HOST, SPI_SLAVE_CHAN_RX, &slave_trans,
+                                                    pdMS_TO_TICKS(SPI_QUEUE_TRANS_TIMEOUT_MS));
+            if (t != ESP_OK) {
+                ESP_LOGE(TAG, "spi_task: queue_trans(RX) timeout/err=0x%x, skip", (unsigned)t);
+                continue;
+            }
+            ESP_LOGE(TAG, "spi_task: RX DMA queued, raise HS");
 
-            // slave has rx done, notify master to do next translation
             gpio_set_level(CONFIG_SPI_HANDSHAKE_PIN, 1);
+            ESP_LOGE(TAG, "spi_task: HS=1, now get_trans_res(RX)");
 
-            ESP_ERROR_CHECK(spi_slave_hd_get_trans_res(SPI2_HOST, SPI_SLAVE_CHAN_RX, &ret_trans, portMAX_DELAY));
+            t = spi_slave_hd_get_trans_res(SPI2_HOST, SPI_SLAVE_CHAN_RX, &ret_trans,
+                                            pdMS_TO_TICKS(SPI_GET_RES_TIMEOUT_MS));
+            if (t != ESP_OK || !ret_trans) {
+                ESP_LOGE(TAG, "spi_task: get_trans_res(RX) timeout/err=0x%x, master didn't send data", (unsigned)t);
+                continue;
+            }
+            ESP_LOGE(TAG, "spi_task: RX DMA done trans_len=%u buf[0..3]=%02X %02X %02X %02X",
+                     (unsigned)ret_trans->trans_len, buffer[0], buffer[1], buffer[2], buffer[3]);
             if (ret_trans->trans_len > CONFIG_RX_STREAM_BUFFER_SIZE || ret_trans->trans_len <= 0) {
                 ESP_LOGE(TAG, "recv wrong len: %d, %d, 0x%x", ret_trans->trans_len, slave_trans.len, buffer[0]);
-                break;
+                continue;
             }
 
             xStreamBufferSend(s_spi_slave_rx_ring_buf, (void *)buffer, ret_trans->trans_len, portMAX_DELAY);
@@ -207,7 +244,7 @@ static void at_spi_task(void *params)
             esp_at_port_recv_data_notify(ret_trans->trans_len, portMAX_DELAY);
 
         } else if (trans_msg.direct == SPI_SLAVE_WR) {
-            // slave -> master
+            // slave -> master (ESP32 有数据要发, 如 ready URC / AT 响应)
             uint32_t to_send_len = 0;
             uint32_t remain_len = xStreamBufferBytesAvailable(s_spi_slave_tx_ring_buf);
             if (remain_len > 0) {
@@ -221,16 +258,30 @@ static void at_spi_task(void *params)
             uint32_t actual_len = xStreamBufferReceive(s_spi_slave_tx_ring_buf, (void *)buffer, to_send_len, 0);
             if (to_send_len != actual_len) {
                 ESP_LOGE(TAG, "read len error (expect:%d actual:%d)", to_send_len, actual_len);
-                break;
+                s_init_tx_flag = 0;
+                continue;
             }
             slave_trans.data = (uint8_t*)buffer;
             slave_trans.len = to_send_len;
-            ESP_ERROR_CHECK(spi_slave_hd_queue_trans(SPI2_HOST, SPI_SLAVE_CHAN_TX, &slave_trans, portMAX_DELAY));
+            t = spi_slave_hd_queue_trans(SPI2_HOST, SPI_SLAVE_CHAN_TX, &slave_trans,
+                                          pdMS_TO_TICKS(SPI_QUEUE_TRANS_TIMEOUT_MS));
+            if (t != ESP_OK) {
+                ESP_LOGE(TAG, "spi_task: queue_trans(TX) timeout/err=0x%x", (unsigned)t);
+                s_init_tx_flag = 0;
+                continue;
+            }
 
             // slave send done and notify master to recv
             gpio_set_level(CONFIG_SPI_HANDSHAKE_PIN, 1);
 
-            ESP_ERROR_CHECK(spi_slave_hd_get_trans_res(SPI2_HOST, SPI_SLAVE_CHAN_TX, &ret_trans, portMAX_DELAY));
+            t = spi_slave_hd_get_trans_res(SPI2_HOST, SPI_SLAVE_CHAN_TX, &ret_trans,
+                                            pdMS_TO_TICKS(SPI_GET_RES_TIMEOUT_MS));
+            if (t != ESP_OK || !ret_trans) {
+                // 关键修复: 主机没来读 (比如第一次启动主机还没初始化), 不要永远卡死
+                ESP_LOGE(TAG, "spi_task: get_trans_res(TX) timeout/err=0x%x, master didn't read", (unsigned)t);
+                s_init_tx_flag = 0;
+                continue;
+            }
 
             at_spi_mutex_lock();
             remain_len = xStreamBufferBytesAvailable(s_spi_slave_tx_ring_buf);
@@ -306,6 +357,7 @@ static void init_slave_hd(void)
 
 static void at_spi_init(void)
 {
+    ESP_LOGE(TAG, "at_spi_init: start");
     // init ring buffer, queue, and mutex
     s_spi_rw_sema = xSemaphoreCreateMutex();
     s_spi_tx_ring_mutex = xSemaphoreCreateMutex();
@@ -316,9 +368,11 @@ static void at_spi_init(void)
         ESP_LOGE(TAG, "create error, free heap heap: %d", esp_get_free_heap_size());
         abort();
     }
+    ESP_LOGE(TAG, "at_spi_init: queue=%p rx_buf=%p tx_buf=%p",
+             (void*)s_spi_msg_queue, (void*)s_spi_slave_rx_ring_buf, (void*)s_spi_slave_tx_ring_buf);
 
     // init gpio
-    ESP_LOGI(TAG, "init gpio");
+    ESP_LOGE(TAG, "at_spi_init: init gpio (HS=%u)", (unsigned)CONFIG_SPI_HANDSHAKE_PIN);
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_OUTPUT;
@@ -329,11 +383,15 @@ static void at_spi_init(void)
     gpio_set_level(CONFIG_SPI_HANDSHAKE_PIN, 0);
 
     // init spi slave driver
-    ESP_LOGI(TAG, "init spi");
+    ESP_LOGE(TAG, "at_spi_init: init spi (SCLK=%u MOSI=%u MISO=%u CS=%u mode=%d)",
+             (unsigned)CONFIG_SPI_SCLK_PIN, (unsigned)CONFIG_SPI_MOSI_PIN,
+             (unsigned)CONFIG_SPI_MISO_PIN, (unsigned)CONFIG_SPI_CS_PIN, CONFIG_SPI_MODE);
     init_slave_hd();
+    ESP_LOGE(TAG, "at_spi_init: spi slave hd OK");
 
     // init spi slave task
-    xTaskCreate(at_spi_task, "at_spi_task", 4096, NULL, 10, &s_task_handle);
+    xTaskCreate(at_spi_task, "at_spi_task", 8192, NULL, 10, &s_task_handle);
+    ESP_LOGE(TAG, "at_spi_init: created task=%p", (void*)s_task_handle);
 }
 
 static void at_spi_sleep_before_cb(esp_at_sleep_mode_t mode)
