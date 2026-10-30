@@ -204,6 +204,7 @@ static void at_spi_task(void *params)
         ESP_LOGE(TAG, "spi_task: got queue msg r=%d direct=%d", (int)qr, (int)trans_msg.direct);
         spi_slave_hd_data_t slave_trans;
         memset(&slave_trans, 0x0, sizeof(spi_slave_hd_data_t));
+        esp_err_t t;   /* 两个分支共用, 放外面避免 C 块作用域冲突 */
 
         if (trans_msg.direct == SPI_SLAVE_RD) {
             // master -> slave (主机发 AT 命令过来)
@@ -214,8 +215,8 @@ static void at_spi_task(void *params)
 
             slave_trans.data = buffer;
             slave_trans.len = AT_SPI_DMA_SIZE;
-            esp_err_t t = spi_slave_hd_queue_trans(SPI2_HOST, SPI_SLAVE_CHAN_RX, &slave_trans,
-                                                    pdMS_TO_TICKS(SPI_QUEUE_TRANS_TIMEOUT_MS));
+            t = spi_slave_hd_queue_trans(SPI2_HOST, SPI_SLAVE_CHAN_RX, &slave_trans,
+                                          pdMS_TO_TICKS(SPI_QUEUE_TRANS_TIMEOUT_MS));
             if (t != ESP_OK) {
                 ESP_LOGE(TAG, "spi_task: queue_trans(RX) timeout/err=0x%x, skip", (unsigned)t);
                 continue;
